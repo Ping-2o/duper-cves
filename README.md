@@ -17,17 +17,17 @@ build. This repository is the result of sweeping the **iOS 27.0 RC → 27.2 RC**
 (released 2026-10-26) — the app-reachable file-parser set and the kernel /
 arbitrary-code-execution set — using that principle.
 
-Eight parallel agent sweeps across two waves — four Tier-1 file-parser component groups, and
-four Tier-3 one-CVE hunts (the kernel/ACE set). Each group folder's `FINDINGS.md` carries the
-full fix-site localization: **what the check is, where it landed (vmaddr), what the vulnerable
-build did instead (both-side disassembly excerpts), and how the missing check is tripped
-(craft recipe — field, seed format, API).**
+Twelve parallel agent sweeps across three waves — four Tier-1 file-parser component groups,
+four Tier-3 one-CVE hunts (kernel/ACE set), and four remaining-bucket groups (XNU kernel UAF
+cluster, video codec kexts, kext OOB primitives, app userspace parsers). Each group folder's
+`FINDINGS.md` carries the full fix-site localization: **what the check is, where it landed
+(vmaddr), what the vulnerable build did instead (both-side disassembly excerpts), and how the
+missing check is tripped (craft recipe — field, seed format, API).**
 
-**Headline score: 36 advisory CVE lines localized** — Tier 1: 32 of 34 easy-achievement lines
-(~29 PROVEN at instruction level, 3 shape-matched, 2 honest negatives); Tier 3: all 4 kernel /
-arbitrary-code-execution lines PROVEN at fix-site level (impact mapping shape-matched where
-noted, honest negatives recorded as negatives).
-All of these bugs are live on any device still running iOS 27.0 / 27.0.1.
+**Headline score: 82 of ~161 advisory CVE lines receipted** — ≈45 PROVEN/CONFIRMED at
+instruction level with both-side receipts; the rest shape-graded pools; every negative result
+recorded honestly with its checked-surface list (Webkit-scoped and privacy/logic lines excluded
+by campaign policy). All of these bugs are live on any device still running iOS 27.0 / 27.0.1.
 
 ## The board
 
@@ -41,13 +41,17 @@ All of these bugs are live on any device still running iOS 27.0 / 27.0.1.
 | [`06_iohidfamily_112515/`](06_iohidfamily_112515/) | CVE-2026-112515 (1) | PROVEN: HID preparsed-data caps-table lookup — attacker-controlled signed int32 index into `table + idx*0x14 + 8` with only a multiply-overflow trap, no idx-vs-count check (negative index reads below the table, overshoot reads adjacent kernel heap; the leaked u32 lands in element/event data = kernel disclosure). 27.2 adds `cmp idx,count; b.ge` + NULL guard + 64-bit index math — the only bounds-check family in the entire 2815-function kext diff. Reach: kernel-side serialized "hid " descriptor container (peripheral lane; app-side reachability open) |
 | [`07_usb_112479/`](07_usb_112479/)             | CVE-2026-112479 (1) | PROVEN (fix), impact shape-matched: CDC-NCM 1.1 `GET_NTB_PARAMETERS` alignment fields cached unvalidated → 27.2 adds power-of-2∧≥4 gates + OUT-NTB builder `udiv` zero-guards. Trigger: a CDC-NCM 1.1 gadget answering `0xA1/0x80/wLength 0x1C` with poisoned alignment (wire offsets 22/12). Negative census: 41 USB kexts instruction-counted, only these two carry fixes |
 | [`08_compression_113910/`](08_compression_113910/) | CVE-2026-113910 (1) | PROVEN: kernel-side AppleFSCompressionTypeZlib (`ChunkCompression.cpp`, 182.0.0→182.40.4) — a chunk decompression under-produce left kernel page-buffer tails **unwritten = stale kernel heap handed to the reading app**; 27.2 adds the single produced-vs-expected gate. Reach: read()/mmap of a decmpfs chunked-compressed file. Userspace Compression framework / kec.Compression / libcompression = churn (honest negatives) |
+| [`09_kernel_uaf/`](09_kernel_uaf/) | CVE-2026-112507, 112606, 65350, 112679, 112517, 112516, 112514, 84495, 112474, 112698, 112476, 112665, 112624 (13) | **NEW fix family both prior kernel passes missed: the ipc_port request-table validation wave** (12 new 27.2 asserts; `ipr != ((void*)0)` marker 0→1). Three pre-fix defect shapes PROVEN both sides: free-path OOB write whose csel bounds result is DISCARDED (strongest shape match for 112507's "write kernel memory"), mark-path OOB read+write with no bounds (send-path), type-query unchecked read (112476). 112665/112624 NULL re-confirmed with fresh string diffs; the exclaves framebank demoted (non-app-reachable). Ready device oracle `k_ipc1_racer.c` (27.0 data-abort vs 27.2's own brk naming ipc_port.c:34/38/40/41) |
+| [`10_video_codec_kexts/`](10_video_codec_kexts/) | CVE-2026-112416, 112415, 112454, 112705, 112689, 112470, 112469, 112468, 112466 (9) | Per-CVE assignment over the codec gate wave. **CVE-2026-112705 CONFIRMED** (Calif.io credit + 8 on-device panic receipts; plugin bound `iNumberOfTemporalLayers >= 1` → `0 < x <= 7` string-delta). **AVD trio: fix carrier is the in-process `AVD.videodecoder` plugin, NOT the kext** — 112416 = AVC slice cap ("too many slices!"; NAL-verified seeds 32→900 slices = the cleanest single-cell A/B), 112415 = MVHEVC layer-ID validation, 112454 = histogram IOSurface pointer→random cookie. AVE: 112470/112469/112468/112466 assigned over the gate wave (112466 = the kernel-read/extcal channel). Unmapped fixes (alias check, MB/CTU clamp, PPS asserts) = candidate unlisted fixes |
+| [`11_kext_oob/`](11_kext_oob/) | CVE-2026-112554, 112456, 112696, 84494, 112477, 65385, 112459 (7) | 112554 PROVEN (GPT partition-name scan bound 0x48→0x24 = 72B kernel-heap OOB read; seed built). **112456: no HFS kext exists in the iPhone17,5 kernelcache — carrier is userspace `livefiles_hfs.dylib`** (B-tree swapper on-disk keyLength trust; iOS app-reach closed, macOS twin open). ANE 112696/84494 PROVEN wave in AppleH16ANEInterface (unchecked program symbolIndex → kernel tables with storeback = "write kernel memory"). **112477 PROVEN — prior null overturned** by a layout-churn-robust shape differ: uc pending-list teardown race → closing flag under lock. **65385: carrier is IOKit.framework** (IOHIDEventAppendEvent fixed-offset OR-write on short heap events). 112459 scope-NULL receipt-backed (DCP-firmware side) |
+| [`12_app_userspace/`](12_app_userspace/) | CVE-2026-112638, 112619, 112646, 112491, 112547, 112691, 112682 (7) | **112638 PROVEN — the "radio range" line resolved: LC3, the Bluetooth LE-Audio codec** (`ACLC3Decoder::AppendInputData` memcpy with no capacity check → (begin,end)+reject gate; entitlement-gated → system process = "system termination"). 112619 Calendar SHAPE (fix PROVEN but NOT in .ics — the event-attachment archive unzip containment in CalendarFoundation). 112646 SpringBoard SHAPE (new stash-layout-name validation on the app-reachable XPC). 112491 RealityKit SHAPE-STRONG (carrier = libusd_ms again — covers two advisory sections). 112547/112691/112682 honest NOT-LOCALIZED (replayd/SwiftUI-churn/imagent daemons outside the dyld cache) |
 
 Per-group detail — including every vmaddr, both-side disassembly, trigger APIs, expected
 crash-vs-refusal A/B behavior, and the craft recipes — is in each group's `FINDINGS.md`.
 
 ## What is deliberately NOT in this repo
 
-This repo ships **analysis only**: this README and the eight group `FINDINGS.md` documents.
+This repo ships **analysis only**: this README and the twelve group `FINDINGS.md` documents.
 The underlying research tree additionally contains — and does NOT publish:
 
 - **PoC artifacts (`seeds/` in each group).** The actual crafted crash-trigger files. The
@@ -62,15 +66,19 @@ The underlying research tree additionally contains — and does NOT publish:
 ## Repo layout
 
 ```
-README.md              this file
-01_imageio/FINDINGS.md          11 CVE lines — ImageIO fix families + craft recipes + census
-02_image_libarchive/FINDINGS.md       112522 / 112621 / 86971 PROVEN, 86988 honest negative
-03_audio/FINDINGS.md           5 CVE lines — audio stack + the honest 86969 negative
-04_font_model3d/FINDINGS.md    14 CVE lines — fonts, CoreText, libusd_ms, SceneKit
-05_coremedia_112688/FINDINGS.md    the "arbitrary code execution" line — Dolby Vision RPU parser
+README.md                        this file
+01_imageio/FINDINGS.md              11 CVE lines — ImageIO fix families + craft recipes + census
+02_image_libarchive/FINDINGS.md     112522 / 112621 / 86971 PROVEN, 86988 honest negative
+03_audio/FINDINGS.md                5 CVE lines — audio stack + the honest 86969 negative
+04_font_model3d/FINDINGS.md        14 CVE lines — fonts, CoreText, libusd_ms, SceneKit
+05_coremedia_112688/FINDINGS.md     the "arbitrary code execution" line — Dolby Vision RPU parser
 06_iohidfamily_112515/FINDINGS.md  kernel OOB read — HID caps-table index
-07_usb_112479/FINDINGS.md          CDC-NCM NTB parameter validation wave
-08_compression_113910/FINDINGS.md  kernel disclosure — decmpfs under-produce (ChunkCompression.cpp)
+07_usb_112479/FINDINGS.md           CDC-NCM NTB parameter validation wave
+08_compression_113910/FINDINGS.md   kernel disclosure — decmpfs under-produce (ChunkCompression.cpp)
+09_kernel_uaf/FINDINGS.md           XNU UAF/race cluster — the ipc request-table wave + racer oracle
+10_video_codec_kexts/FINDINGS.md    per-CVE assignment: AVD plugin + AVE gate wave (112705 CONFIRMED)
+11_kext_oob/FINDINGS.md             GPT scan / livefiles_hfs / ANE / IOSurface / IOKit carriers
+12_app_userspace/FINDINGS.md        LC3 (LE-Audio), Calendar attachments, SpringBoard stash, RealityKit
 ```
 
 ## Method (so you can verify any claim)
@@ -116,6 +124,15 @@ The strongest candidates for new, creditable reports (all recorded in the group 
    unchecked at cache.
 9. CoreMedia `hevcbridgeParseVDRRPUDataPayload` +104B unreconstructed rewrite; writer-side
    re-serializers of corrupted counts; the unchanged AV1-DOVI T.35 path feeding the same parser.
+10. **AudioCodecs `AppendInputData` override census** — 11 decoders show no pre-bl compare at
+    heuristic grade; instruction-level audit is the cheap follow-up.
+11. **The five MCTF/LRME FIG keys** (encoder plugin) — setters instruction-identical in both
+    builds, no assert in either kext: believed live on current 27.2.
+12. kern_exit `faults_idx` — its bound assert is compiled out (data-only) in BOTH builds.
+13. livefiles_hfs per-record offset walk ungated in both builds; ANE deeper callee behind the
+    single new gate; GPT LBA×blocksize unbounded; IOSurface flush-under-lock.
+14. Calendar attachment re-archive WRITER unfixed; SBIconStateArchiver iTunes converters;
+    RealityKit `uint32Spans` trap-reachability open.
 
 ## Ethics
 

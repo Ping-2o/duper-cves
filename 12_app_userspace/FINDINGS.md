@@ -1,0 +1,331 @@
+# FINDINGS — cve_groups/12_app_userspace — iOS 27.2 (24A435→24B115) app-reachable USERSPACE parser CVEs
+
+> AI-generated security research (same notice as AGENTS.md). Authorized research on the
+> owner's devices + Apple's publicly-shipped firmware; coordinated disclosure; crash-oracle
+> PoCs only. Device: iPhone 16e (iPhone17,5), iOS 27.0 RC (24A435) — every fix below is
+> LIVE on it. Fixed side: 24B115 dsc extraction (both caches on the ADATA drive).
+> Advisory source: 149230 CSAF JSON (saved at `extracted/149230.json`).
+
+## Verdict table
+
+| CVE | Component | Apple line (CSAF) | Verdict | Fix site (24B115) |
+|---|---|---|---|---|
+| **CVE-2026-112638** | CoreAudio | attacker in radio range → unexpected system termination; heap buffer overflow, bounds checking (Përparim Mjeku, Altin Gashi x2) | **PROVEN** (instruction-level) | `AudioCodecs` 818.0→818.205, `ACLC3Decoder::AppendInputData` capacity gate @0x1bd37d9e8 |
+| **CVE-2026-112619** | Calendar | crafted calendar invitation → memory corruption; OOB write, bounds checking (Ivan Fratric, P0) | **SHAPE-MATCHED** (only Calendar-family fix; iCS parser itself unchanged) | `CalendarFoundation` `_UnzipArchiveWithLimits` + `_CalUnzipEntryDestinationPath`/`_CalUnzipParentIsContained` + `+[CalAttachmentUtils URL:isContainedInDirectory:]`/`isSymbolicLinkAtURL:` |
+| **CVE-2026-112646** | SpringBoard | app → system termination or corrupt process memory; OOB write, bounds checking | **SHAPE-MATCHED** (fix PROVEN, CVE-line mapping imperfect) | `SpringBoard` `+[SBHomeScreenService _validationErrorForStashedLayoutName:]` @0x226e99c30 (empty/≤64/charset) on stash/restore XPC |
+| **CVE-2026-112491** | RealityKit | crafted file → unexpected app termination; OOB read, bounds checking (Hongsik Kim) | **SHAPE-MATCHED** (strong; fix lives in the shared `libusd_ms` 24.1.30→24.1.32) | `libusd_ms.dylib` SdfZipFile rewrite / `adobe::usd::Image::allocate/read` checked / `HdStPtexMipmapTextureLoader::Block` guards; plus `_USDKit_RealityKit` new `VtArray<Int>.uint32Spans` precondition getter @0x25289379c |
+| **CVE-2026-112547** | ReplayKit | app → sensitive data access; type confusion, improved checks (Stuart Wallace) | **NOT LOCALIZED** (honest negative — dsc-resident candidates are feature churn; replayd is on the system volume, out of dsc reach) | — |
+| **CVE-2026-112691** | SwiftUI | app → unexpected system termination; OOB write, input validation (@Licht_jb) | **NOT LOCALIZED** (honest negative — 4,271 added / 7,849 removed / 4,345 changed functions in SwiftUICore = unrecoverable churn) | — |
+| **CVE-2026-112682** | Messages | remote attacker → unexpected app termination; input validation (Mahmoud Abdelmoniem) | **NOT LOCALIZED** (honest negative — all Messages-family binaries diffed; no validation-fix shape; fix likely in imagent-class daemon outside the dsc) | — |
+
+---
+
+## 1. CVE-2026-112638 — CoreAudio LC3 heap overflow — **PROVEN**
+
+**The radio codec.** LC3 is the Bluetooth LE-Audio stream codec. Radio-delivered LC3
+frames flow into the system audio stack's LC3 decoder (codec instantiation is
+entitlement-gated: AudioCodecs carries `com.apple.coreaudio.allow-lc3-codec`), so the
+decode — and the crash — happen in a system process ("unexpected **system**
+termination").
+
+**The fix (both-side receipts, `extracted/receipts/CVE-2026-112638_*.asm`):**
+
+- 24A435 `ACLC3Decoder::AppendInputData` @**0x1bcbe16d8** (AudioCodecs 818.0):
+  ```
+  0x1bcbe1754  tbnz x9,#0x3f,...     ; only a negative-offset check on mStartOffset
+  0x1bcbe1758  add  x8, x1, x9       ; src = inData + aspd->mStartOffset
+  0x1bcbe175c  ldr  x0, [x21,#0xb8]  ; dst = mInputBuffer  (vector BEGIN only)
+  0x1bcbe1764  mov  x2, x22          ; len = aspd->mDataByteSize   <<< attacker-controlled
+  0x1bcbe1768  bl   memcpy           ; NO CAPACITY CHECK — heap buffer overflow
+  ```
+- 24B115 @**0x1bd37d96c** (AudioCodecs 818.205):
+  ```
+  0x1bd37d9e8  ldp  x0, x8, [x21,#0xb8]  ; (begin, end) of the input vector
+  0x1bd37d9ec  sub  x8, x8, x0            ; capacity = end - begin
+  0x1bd37d9f0  cmp  x8, x22               ; capacity vs aspd->mDataByteSize
+  0x1bd37d9f4  b.lo reject                 ; if capacity < size -> NO COPY, zero-out
+  ```
+- The input buffer is a `std::vector<uint8_t>` at self+0xb8/+0xc0 (`Initialize` calls
+  `vector<uchar>::resize` at +0xb8 in BOTH builds) — 27.0 used only the begin pointer.
+- `ACLC3Decoder::Initialize` +8 bytes (24B115) = the (begin,end) bookkeeping.
+- funcdiff: `ACLC3Decoder::AppendInputData` 192→204, `Initialize` 3336→3344 — the
+  ONLY ACLC3 changes in the whole AudioCodecs diff. Responsive-fix shape.
+
+**Trigger recipe:** an LE-Audio stream (or crafted accessory in radio range) supplies
+LC3 packets; the attacker controls the packet description (`mDataByteSize`,
+`mStartOffset`). Declaring `mDataByteSize` >> input-vector capacity makes the 27.0
+memcpy write past the heap buffer. Oracle spec: `seeds/lc3_oracle_spec.json`
+(generated by `scripts/lc3_oracle.py`).
+
+**A/B oracle:** 27.0 RC (24A435) = heap corruption/SIGSEGV in the system audio
+process; 24B115 = silent rejection (AppendInputData consumes 0 bytes, zeroes the
+output counters). NOTE: in-app reach is entitlement-gated — the crash-oracle must ride
+the radio path (LE-Audio source) or a system-process harness; see HARNESS_ROW.md.
+
+**Sibling census (credit engine):**
+- `ACLC3Encoder::AppendInputData` — already safe in BOTH builds (`csel` clamps size to
+  remaining capacity, @0x1bd3b6e00). Encoder clean.
+- `ACSimpleCodec::AppendInputData` (the base class most decoders delegate to) — safe
+  in BOTH builds: `used + byteSize vs capacity @self+0xb0` with a partial-copy path
+  (@0x1bd2086a4-0x1bd2086f8 in 24B115). Base class clean.
+- Heuristic scan (`scripts/lc3_siblings.sh`) of all 54 `AppendInputData` impls in
+  24B115: the zero-cmp overrides (`ACAMRDecoder`, `ACEVSDecoder`, `ACGSMDecoder`,
+  `ACFLACDecoder`, `ACACCFDecoder`, `ACAPACBaseDecoder`, `ACDDPAtmosDecoder`,
+  `ACUSACDecoder`, `ACProtectedAudibleAAXDecoder`, `ACMP4AACBaseDecoder`,
+  `ACAGVCDecoder`) either delegate to the safe base or do early outs — spot-checked
+  FLAC (own logic with early-outs). **No second unbounded decoder found at heuristic
+  grade; full instruction-level verification of each override remains OPEN — a
+  low-effort OUR-credit audit.**
+
+---
+
+## 2. CVE-2026-112619 — Calendar invitation memory corruption — **SHAPE-MATCHED**
+
+**What we can prove (the ONLY Calendar-family fix in the window):**
+`CalendarFoundation` (1636.0.100→1636.2.2) gained a complete attachment-archive
+extraction-hardening family, absent in 24A435:
+- `_UnzipArchiveWithLimits` (new, 2040 B + cold) — 24A435's `_UnzipArchive` (288 B,
+  no limits) is now a 12-byte tail-call wrapper.
+- `__CalUnzipEntryDestinationPath` (new, 632 B), `__CalUnzipParentIsContained` (new,
+  336 B), `__CalUnzipTrackTopLevelPath` (new, 452 B),
+  `____CalUnzipRemoveEscapingSymlinks_block_invoke` (new, 144 B),
+  `+[CalAttachmentUtils URL:isContainedInDirectory:]` (new, 352 B),
+  `+[CalAttachmentUtils isSymbolicLinkAtURL:]` (new, 208 B).
+- New refusal strings (0→4):
+  `Archive entry exceeds total size limit (%llu bytes); canceling extraction.`
+  `Archive exceeds item count limit (%lu); canceling extraction.`
+  `Archive exceeds total size limit (%llu bytes) while writing an entry; canceling extraction.`
+  `Archive exceeds total size limit (%llu bytes); canceling extraction.`
+- Receipts: `__CalUnzipCopyFileStarted` @0x1c14735b0 (24B115) shows the per-entry
+  count increment + `cmp; b.ls` cap, the running-size `cmp x21, x8` budget check,
+  then `__CalUnzipEntryDestinationPath` → `__CalUnzipParentIsContained` →
+  `__CalUnzipTrackTopLevelPath` (extracted/receipts/…CopyFileStarted…asm).
+  24A435's `_UnzipArchive` @0x1c0c64b40 is a limit-free 7-call wrapper
+  (receipts/…UnzipArchive_24A435.asm).
+- The consumer chain exists in BOTH builds: EventKit's `EKAttachment` (the 24B115 side
+  adds `localURLExpandingArchiveIfNeeded`), CalendarDatabase's
+  `__CalAttachmentFileSetFileDataWithOpenFile` / `__CalAttachmentFileCopyLocalURLForArchivedData`
+  / `_ICSAttachmentFromCalAttachment` (+112) — event ATTACHMENTS are stored re-archived
+  as PKZip (CalendarFoundation NSFileManager category `createPKZipArchive`) and
+  expanded on open.
+
+**Mapping (honest):** a calendar event/invitation (.ics / CalDAV-synced) carrying an
+ATTACHMENT is the app-remote surface that reaches the unlimited unzip; the 27.2 fix
+family (size/count budgets = "improved bounds checking", containment + symlink
+removal) is the only Calendar-family fix that exists. Grade **SHAPE-MATCHED** because:
+(a) the advisory words the bug as an OOB write in "invitation processing" and the
+fix we can prove is extraction-budget/path hardening — close shape, not a caught
+memcpy; (b) iCalendar.framework — the .ics parser itself — is **BYTE-IDENTICAL**
+between builds (same size, same 1170 text symbols, same function layout; only
+cache-rebase bytes differ). If Fratric's bug is in raw .ics parsing, it was NOT
+fixed in the dsc image set (CalendarMigration/CalendarNotification/CalendarLink/
+CalendarDaemon/CalendarIntegrationSupport/EventKitSyncServices/CalendarWidget/
+iCalendar/DASubCal all funcdiff to 0/0/0 or feature churn).
+
+**Craft recipe:** seeds built by `scripts/cal_zip_oracle.py`:
+`calzip_slip.zip` (escaping entry name), `calzip_bomb.zip` (declared-huge entry),
+`calzip_symlink.zip` (S_IFLNK entry → `../../etc`), `calzip_names.zip` (300 entries).
+Attach the zip to a calendar event/invitation; open the attachment (Calendar event
+detail / Mail invite preview) on 27.0 RC. 27.2 refuses with the receipt strings
+above. **A/B oracle:** 27.0 = extraction proceeds (escaped file appears / disk
+fills / symlink created); 24B115 = refusal string + cancelled extraction.
+
+**Sibling census (credit engine):** the 24B115 `_UnzipArchiveWithLimits` budget
+checks fire per-entry but the per-entry `mStartOffset`-style metadata handling and
+the `createPKZipArchive` (writer) side in `NSFileManager(CalClassAdditions)` went
+unverified — the writer-side (event-attachment re-archiving) trusts source-file
+metadata in both builds. OUR-credit audit candidate.
+
+---
+
+## 3. CVE-2026-112646 — SpringBoard OOB write — **SHAPE-MATCHED (fix PROVEN)**
+
+**The proven fix (the only app-input-validation addition in SpringBoard's diff):**
+- NEW `+[SBHomeScreenService _validationErrorForStashedLayoutName:]` @0x226e99c30
+  (412 B + cold.1) — validates an app-supplied layout NAME on the Home Screen
+  Service XPC surface:
+  - charset allowlist `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_`
+    (string @c7ec6c), first check is a `rangeOfCharacterFromSet:`-style call
+    (`bl 0x22815ddf0` + `tbz w0,#0`);
+  - `bl 0x228001c10` (length) → `cbz` empty check → "Layout name must not be empty."
+    (@c7ecad);
+  - `cmp x0,#0x41` (65) `b.lo` → cap 64 → "Layout name must be %lu characters or
+    fewer." (@c7eccc, immediate `mov w8,#0x40` fed as %lu);
+  - "Layout name "%@" contains invalid characters; only letters, digits, '-', and
+    '_' are allowed." (@c7ecf9).
+- Both `-[SBHomeScreenService stashHomeScreenLayoutWithName:]` and
+  `restoreStashedHomeScreenLayoutWithName:` gained new cold paths (.cold.2/.cold.3)
+  = the validation-failure receipts. 24A435's `restoreStashedHomeScreenLayoutWithName:`
+  @0x224ed8b64 has NO name validation (receipts/SpringBoard_restore…_24A435.asm).
+- Related log receipt (both sides): "failed to save icon state for stashed layout
+  "%{public}@"" — the stash is persisted icon state, i.e. the name reaches a
+  persistence layer in SpringBoard.
+
+**Mapping (honest):** the stash/restore name surface IS app-reachable and the fix IS
+a bounds/charset/validation addition — but "OOB write → corrupt process memory"
+maps imperfectly (the shape is path/input validation on a persisted-key surface,
+likely guarding a fixed-size assumption downstream in the icon-state stash store).
+SpringBoard's full diff (249 added/88 removed/215 changed) is dominated by feature
+work (Folder-open attempts, brightness coordinators, layout-state churn); no
+alternative bounds-check family surfaced in strings. Grade **SHAPE-MATCHED** —
+fix proven, exact CVE attribution open until the credited researcher's disclosure.
+
+**Craft recipe:** `scripts/sb_stash_oracle.py` writes the four oracle names
+(empty / 65-char / path+meta chars / 64-char allowlisted control). Fire them via
+the SBHomeScreenService stash/restore XPC (the app-reachable surface: any app can
+request icon replacement/swap — the same service gained
+`replaceApplicationIconsWithBundleIdentifier:…options:` in 24B115).
+**A/B oracle:** 27.0 = accepts (stash file/restore attempt with crafted name —
+observable behavior/crash receipt); 24B115 = clean NSError with the exact receipt
+strings above.
+
+**Sibling census:** `-[SBIconStateArchiver modernizedRootArchiveFromITunesRepresentation:]`
++ `_rootArchiveByAssigningMissingFolderIdentifiers:` (new in 24B115) parse
+external/iTunes-representation icon-state plists; the older conversion family
+(`_modernIconCellForCell:` etc., present in both builds) was NOT audited for index
+validation — OUR-credit audit candidate on the icon-state plist consumers.
+
+---
+
+## 4. CVE-2026-112491 — RealityKit OOB read — **SHAPE-MATCHED (strong)**
+
+**Where RealityKit's file parsing actually lives:**
+- `_USDKit_RealityKit` (106.0.10→106.40.4) has 264 UNDEFINED `pxrInternal__aapl__`
+  imports resolved from **`/usr/lib/usd/libusd_ms.dylib`** (44,475 exported pxr
+  symbols — the linkage was verified by exact import/export match).
+- `libusd_ms.dylib` went **24.1.30 → 24.1.32** — the SAME fixed library that group
+  04 (`cve_groups/04_font_model3d`) receipt-verified as the ModelIO/SceneKit fix
+  carrier. Our own funcdiff of libusd_ms (extracted/funcdiff_libusd_ms.txt) shows
+  the identical fix family:
+  - `SdfZipFile::Open` +408, `Iterator` ctor +440/+116, `GetFile` 24→776, `Find`,
+    `DumpContents`, `Iteratorpp` — the SdfZipFile rewrite (crafted USDZ edge);
+  - `adobe::usd::Image::allocate` 72→496 and `Image::read` 420→820 — checked
+    allocations on image reads;
+  - `HdStPtexMipmapTextureLoader::Block::SetSize` 60→488 and `Block::Generate`
+    512→1192 — the Ptex guards (Ptex is rendered through Hydra Storm → RealityKit
+    renders via HdRealityKit);
+  - `aaplUsdGclCodec::compressMesh` +3692.
+- `RealityKit.framework` itself (453.2.1→453.42.1) = AR/accessibility churn only;
+  `_RealityKit_ComputeGraph` (30.0→30.40.1) = API-rename churn;
+  `RealityFoundation` = material-program churn. No bounds fix in any of them.
+- Additional 24B115 guard in `_USDKit_RealityKit`: NEW
+  `VtArray<Int>.uint32Spans: Span<UInt32>` getter @0x25289379c with Swift Span
+  preconditions (cdata NULL check `cbz → brk #1`, negative-size `tbnz #0x3f`,
+  4-byte alignment `tst #3`), and NEW out-of-line `VtArray<int>::size()/cdata()`
+  call sites — 27.0 built `Foundation.Data` straight from VtArray storage
+  (`__DataStorage(bytes:length:…)` imports) with no such guards.
+
+**Mapping:** a crafted USD/USDZ/Ptex opened through RealityKit's importer
+(`RealityView`/`Model3D`/ARKit QuickLook path) parses via libusd_ms 24.1.30 in 27.0
+— the 24.1.32 library fixed OOB reads in exactly those parsers (group 04's proven
+receipts + our diff). Grade **SHAPE-MATCHED (strong)**: the fix is proven and
+RealityKit-reachable; the specific site among the SdfZip/Image/Ptex family that
+Apple attributed to THIS CVE (vs the ModelIO/SceneKit CVEs, same library) can't be
+split without the researcher's PoC.
+
+**Craft recipe:** `scripts/usd_index_oracle.py` builds
+`rk_mesh_empty_indices.usda` (empty `faceVertexIndices`), `rk_mesh_oob_indices.usda`
+(indices 0x100000 far past `points`), and `rk_mesh_oob_indices.usdz` (wrapped + an
+empty-name zip edge entry). Load through RealityKit on 27.0 RC (app context: `Model3D`
+/ `RealityView` / QuickLook 3D preview).
+**A/B oracle:** 27.0 = app termination (OOB read) in the rendering app; 27.2 = clean
+load/refusal of the invalid mesh. Library-level receipts: the 24.1.30 vs 24.1.32
+disassembly in group 04 + `extracted/funcdiff_libusd_ms.txt` here.
+
+**Sibling census:** group 04's unfixed-neighbor list applies verbatim to the
+RealityKit surface (libusd gcl decode path, USDA nesting edges beyond the cap,
+Ptex beyond the guarded blocks). NEW here: the `uint32Spans` getter TRAPS
+(`brk #1`) instead of recovering — an empty-index mesh that reaches it converts a
+silent OOB read into a deterministic crash; whether any 27.2 RealityKit path can
+still reach the trap (vs the caller guarding first) is OUR-credit audit candidate.
+
+---
+
+## 5. CVE-2026-112547 — ReplayKit type confusion — **NOT LOCALIZED (honest negative)**
+
+Checked (funcdiff + strings), all feature churn or clean:
+- `ReplayKit.framework` 740.63.1.2.0→765.15.2.0.0: 5 added/3 removed — reactions-tip →
+  edge-light UI churn; zero type-check strings (`strdiff/ReplayKit.added` has no
+  invalid/check/confusion receipt).
+- `ScreenCaptureKit.framework` (same version pair): `SCContentFilter
+  setContentsAndStreamTypeEmbedded` +156 B is stack-guard + application-context-ID
+  feature work; `SCControlCenterManager` register/unregister/callObserver +28 B each =
+  an os_unfair_lock pair, not a type check; `SCRemoteQueue_EnqueueSampleBuffer` +8.
+- `ScreenSharingKit` 114.56→126.12: Swift metadata churn only.
+- `ScreenContinuityServices`, `_ScreenCaptureKit_SwiftUI`, `ScreenshotServices`
+  (447.100→452.1.3.100): not examined beyond version (family not the titled binary);
+  `AudioAccessoryKit` 40.41.1.1.10→41.7.0.0.0 = rebase-only (funcdiff 0/0/1 noop).
+- The ReplayKit daemon **replayd is a system-volume binary — not in the dsc**
+  (METHODOLOGY §4a rule 4); the type-confusion fix most plausibly lives there or in
+  the XPC glue we cannot extract with the dsc recipe.
+
+**Status:** honest negative for static localization in the dsc-resident set. Re-open
+condition: the owner's system-volume extraction pipeline (ipsw system dmg) or the
+researcher's disclosure.
+
+## 6. CVE-2026-112691 — SwiftUI OOB write — **NOT LOCALIZED (honest negative)**
+
+- `SwiftUI` 8.0.84.1.104→8.1.13.1.103 and `SwiftUICore` (same version): funcdiff =
+  **4,271 added / 7,849 removed / 4,345 size-changed** functions; 12,749 added strings —
+  full framework-churn window; no isolable validation/bounds receipt at strings level
+  (the only "out of bounds in" hit is the Swift stdlib collection message present in
+  BOTH builds).
+- System-rendered-SwiftUI consumers checked for a paired fix: `WidgetKit`
+  (749.0.2→749.2.13.200), `ChronoCore`, `WidgetRenderer`, `ScreenshotServices` —
+  funcdiffs are churn; no bounds-check additions in strings.
+- Leading hypothesis (OPEN): app → widget/control archive deserialized by a system
+  process → SwiftUI render path OOB write → system termination (cross-link: the
+  SpringBoard/WidgetKit rendering path). No static receipt — honest negative.
+
+## 7. CVE-2026-112682 — Messages remote app termination — **NOT LOCALIZED (honest negative)**
+
+Full Messages-family sweep (all extracted to `extracted/{24A435,24B115}/` and funcdiffed):
+- **Byte-identical (0/0/0):** `Messages.framework`, `IMDMessageServices`,
+  `IMRCSTransfer` (RCS!), `MMCSServices` (attachment transfer), `IMCorePipeline`,
+  `IDSBlastDoorSupport`, `IMSharedUI`, `MessageSecurity` (3 changed = Swift metadata),
+  `DASubCal`, `CalendarMigration`.
+- **Churn only:** `ChatKit` (737 added/619 removed/530 changed — the 27.2 Messages
+  redesign; no validation receipt in 12,372 added strings),
+  `FaceTimeMessageStore` (319 added — feature work, zero validation strings),
+  `IMCore` (5 added = reply-thread grouping features), `MessagesBlastDoorSupport`
+  (Swift metadata), `MessagesSupport` (device-support stubs removed),
+  `IMFoundation` (4 changed — the XPC-allowlist function is instruction-identical),
+  `IMDPersistence` (7 added, feature), `IMDaemonCore`, `IDSFoundation`,
+  `MessageSupport`.
+- The remote-message parse/validate fix for this advisory line is most plausibly in
+  **imagent / IMDaemonCore's runtime daemon or the RCS/mail injection glue on the
+  system volume** — outside the dsc. Honest negative; re-open with the system-volume
+  extraction.
+
+---
+
+## Top sibling candidates (OUR credit engine, live on 27.0 AND 27.2)
+
+1. **AudioCodecs `AppendInputData` override census** — 11 decoders show zero pre-bl
+   compares at heuristic grade (`scripts/lc3_siblings.sh`); encoder + base class
+   proven safe; a per-override instruction-level audit is cheap and carries our
+   credit if any matches the LC3-27.0 shape.
+2. **Calendar attachment re-archive writer** — `NSFileManager(CalClassAdditions)
+   createPKZipArchive` (CalendarFoundation) is the WRITE side of the fixed unzip;
+   its source-metadata trust went un-fixed in 27.2.
+3. **SBIconStateArchiver iTunes-representation converters** — the new 24B115
+   `_rootArchiveByAssigningMissingFolderIdentifiers:` modernization ran alongside,
+   not over, the older `_modernIconCellForCell:` family (present in both builds).
+4. **RealityKit `uint32Spans` trap-reachability** — does any 27.2 RealityKit path
+   reach the new Swift Span preconditions with attacker-controlled empty VtArray
+   (deterministic `brk #1` crash), i.e., a fix that still crashes?
+5. **libusd_ms unfixed neighbors** — group 04's list (gcl decode, USDA nesting
+   beyond the cap, Ptex beyond the guarded blocks) applies verbatim to the
+   RealityKit importer surface.
+
+## Files produced (this folder)
+
+- `FINDINGS.md` (this file), `HARNESS_ROW.md` (probe-row spec APPU-1)
+- `extracted/` — both-build dylibs (53 images), full dylib listings
+  (`dylibs_24A435.txt`/`dylibs_24B115.txt`), `verdiff_all.txt`, per-image
+  `funcdiff_*.txt` (~40), `strdiff/` per-image string diffs, `receipts/`
+  (both-side disassembly excerpts, 7 files), `149230.json` (advisory CSAF).
+- `scripts/` — verdiff.py, extract_group.sh, strdiff.sh, pystrings.py, funcdiff.py,
+  usd_find_sizecallers.sh, lc3_siblings.sh (census), cal_zip_oracle.py,
+  sb_stash_oracle.py, lc3_oracle.py, usd_index_oracle.py (seed generators).
+- `seeds/` — 11 crash-oracle seeds/specs (4 calzip, 4 sb-stash names, 3 USD, 1 LC3 spec).
